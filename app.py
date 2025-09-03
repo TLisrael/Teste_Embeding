@@ -5,15 +5,323 @@ import warnings
 import re
 import uuid
 import os
-from datetime import datetime
+import sqlite3
+import hashlib
+from datetime import datetime, timedelta
+from contextlib import contextmanager
 
 # Suprimir ResourceWarning temporariamente
 warnings.filterwarnings("ignore", category=ResourceWarning)
 
 app = Flask(__name__)
 
-# Dicionário para armazenar as respostas temporariamente
+# Configuração do banco de dados
+DATABASE = 'chatbot_memory.db'
+
+# Configuração de debug - altere para False em produção
+DEBUG_MEMORY = True
+
+class DatabaseManager:
+    def __init__(self, db_path=DATABASE):
+        self.db_path = db_path
+        self.init_database()
+    
+    def init_database(self):
+        """Inicializa o banco de dados e cria as tabelas necessárias"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            
+            # Tabela de usuários (identificados por IP)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ip_hash TEXT UNIQUE NOT NULL,
+                    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    total_messages INTEGER DEFAULT 0
+                )
+            ''')
+            
+            # Tabela de conversas
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS conversations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    session_id TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_message_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    title TEXT,
+                    FOREIGN KEY (user_id) REFERENCES users (id)
+                )
+            ''')
+            
+            # Tabela de mensagens
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    conversation_id INTEGER,
+                    message_type TEXT NOT NULL, -- 'user' ou 'ai'
+                    content TEXT NOT NULL,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    response_id TEXT UNIQUE,
+                    FOREIGN KEY (conversation_id) REFERENCES conversations (id)
+                )
+            ''')
+            
+            # Índices para melhor performance
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_users_ip_hash ON users (ip_hash)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_conversations_user_id ON conversations (user_id)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON messages (conversation_id)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages (timestamp)')
+            
+            conn.commit()
+    
+    def get_user_id(self, ip_address):
+        """Obtém ou cria um usuário baseado no IP"""
+        ip_hash = hashlib.sha256(ip_address.encode()).hexdigest()
+        
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            
+            # Tentar encontrar usuário existente
+            cursor.execute('SELECT id FROM users WHERE ip_hash = ?', (ip_hash,))
+            user = cursor.fetchone()
+            
+            if user:
+                # Atualizar último acesso
+                cursor.execute('''
+                    UPDATE users 
+                    SET last_seen = CURRENT_TIMESTAMP 
+                    WHERE id = ?
+                ''', (user[0],))
+                return user[0]
+            else:
+                # Criar novo usuário
+                cursor.execute('''
+                    INSERT INTO users (ip_hash, first_seen, last_seen) 
+                    VALUES (?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ''', (ip_hash,))
+                return cursor.lastrowid
+    
+    def get_current_conversation_id(self, user_id):
+        """Obtém ou cria uma conversa única para o usuário (sem sessões separadas)"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            
+            # Procurar conversa existente do usuário (sempre a mesma)
+            cursor.execute('''
+                SELECT id FROM conversations 
+                WHERE user_id = ?
+                ORDER BY created_at ASC 
+                LIMIT 1
+            ''', (user_id,))
+            
+            conversation = cursor.fetchone()
+            
+            if conversation:
+                # Atualizar timestamp da última mensagem
+                cursor.execute('''
+                    UPDATE conversations 
+                    SET last_message_at = CURRENT_TIMESTAMP 
+                    WHERE id = ?
+                ''', (conversation[0],))
+                return conversation[0]
+            else:
+                # Criar única conversa para o usuário
+                cursor.execute('''
+                    INSERT INTO conversations (user_id, session_id, created_at, last_message_at, title) 
+                    VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?)
+                ''', (user_id, 'main_conversation', 'Conversa Principal'))
+                return cursor.lastrowid
+    
+    def save_message(self, conversation_id, message_type, content, response_id=None):
+        """Salva uma mensagem no banco"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT INTO messages (conversation_id, message_type, content, response_id, timestamp) 
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ''', (conversation_id, message_type, content, response_id))
+            
+            # Atualizar última mensagem da conversa
+            cursor.execute('''
+                UPDATE conversations 
+                SET last_message_at = CURRENT_TIMESTAMP 
+                WHERE id = ?
+            ''', (conversation_id,))
+            
+            # Atualizar contador de mensagens do usuário
+            cursor.execute('''
+                UPDATE users 
+                SET total_messages = total_messages + 1 
+                WHERE id = (SELECT user_id FROM conversations WHERE id = ?)
+            ''', (conversation_id,))
+            
+            return cursor.lastrowid
+    
+    def get_conversation_history(self, user_id, limit=20):
+        """Obtém histórico recente de conversas do usuário"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT m.message_type, m.content, m.timestamp 
+                FROM messages m
+                JOIN conversations c ON m.conversation_id = c.id
+                WHERE c.user_id = ?
+                ORDER BY m.timestamp DESC
+                LIMIT ?
+            ''', (user_id, limit))
+            
+            return cursor.fetchall()
+    
+    def get_recent_session_messages(self, conversation_id, limit=6):
+        """Obtém as mensagens mais recentes de uma conversa específica para contexto"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT message_type, content, timestamp 
+                FROM messages 
+                WHERE conversation_id = ?
+                ORDER BY timestamp DESC
+                LIMIT ?
+            ''', (conversation_id, limit))
+            
+            return cursor.fetchall()
+    
+    def get_user_conversations(self, user_id):
+        """Lista todas as conversas do usuário"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT c.id, c.session_id, c.created_at, c.last_message_at, c.title,
+                       COUNT(m.id) as message_count,
+                       MAX(CASE WHEN m.message_type = 'user' THEN m.content END) as first_message
+                FROM conversations c
+                LEFT JOIN messages m ON c.id = m.conversation_id
+                WHERE c.user_id = ?
+                GROUP BY c.id, c.session_id, c.created_at, c.last_message_at, c.title
+                ORDER BY c.last_message_at DESC
+            ''', (user_id,))
+            
+            return cursor.fetchall()
+    
+    def get_conversation_messages(self, conversation_id, user_id):
+        """Obtém todas as mensagens de uma conversa específica"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            
+            # Verificar se a conversa pertence ao usuário
+            cursor.execute('''
+                SELECT id FROM conversations 
+                WHERE id = ? AND user_id = ?
+            ''', (conversation_id, user_id))
+            
+            if not cursor.fetchone():
+                return []
+            
+            cursor.execute('''
+                SELECT message_type, content, timestamp, response_id
+                FROM messages 
+                WHERE conversation_id = ?
+                ORDER BY timestamp ASC
+            ''', (conversation_id,))
+            
+            return cursor.fetchall()
+    
+    def update_conversation_title(self, conversation_id, title):
+        """Atualiza o título de uma conversa"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE conversations 
+                SET title = ? 
+                WHERE id = ?
+            ''', (title, conversation_id))
+    
+    def search_conversations(self, user_id, query):
+        """Busca conversas por conteúdo"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT DISTINCT c.id, c.session_id, c.created_at, c.last_message_at, c.title,
+                       m.content as matching_content
+                FROM conversations c
+                JOIN messages m ON c.id = m.conversation_id
+                WHERE c.user_id = ? AND m.content LIKE ?
+                ORDER BY c.last_message_at DESC
+                LIMIT 50
+            ''', (user_id, f'%{query}%'))
+            
+            return cursor.fetchall()
+
+# Inicializar o gerenciador de banco de dados
+db_manager = DatabaseManager()
+
+# Dicionário para armazenar as respostas temporariamente (mantido para compatibilidade)
 stored_responses = {}
+
+def get_client_ip():
+    """Obtém o IP real do cliente considerando proxies"""
+    if request.headers.get('X-Forwarded-For'):
+        return request.headers.get('X-Forwarded-For').split(',')[0].strip()
+    elif request.headers.get('X-Real-IP'):
+        return request.headers.get('X-Real-IP')
+    else:
+        return request.remote_addr
+
+def build_context_from_history(history, max_context=6):
+    """Constrói contexto das conversas anteriores - garante pelo menos 3 interações completas"""
+    if not history:
+        return ""
+    
+    # Reorganizar mensagens por ordem cronológica (mais antigas primeiro)
+    history_ordered = list(reversed(history[:max_context]))
+    
+    context_messages = []
+    user_ai_pairs = []
+    current_pair = {}
+    
+    # Agrupar mensagens em pares usuário-IA para manter contexto completo
+    for msg_type, content, timestamp in history_ordered:
+        if msg_type == "user":
+            if current_pair:  # Se já existe um par incompleto, adicionar à lista
+                user_ai_pairs.append(current_pair)
+            current_pair = {"user": content, "timestamp": timestamp}
+        elif msg_type == "ai" and current_pair:
+            current_pair["ai"] = content
+            user_ai_pairs.append(current_pair)
+            current_pair = {}
+    
+    # Se sobrou um par incompleto (só pergunta sem resposta), adicionar também
+    if current_pair:
+        user_ai_pairs.append(current_pair)
+    
+    # Pegar as últimas 3 interações completas
+    last_interactions = user_ai_pairs[-3:] if len(user_ai_pairs) >= 3 else user_ai_pairs
+    
+    if last_interactions:
+        context_messages.append("🔍 **Contexto das conversas anteriores:**\n")
+        
+        for i, interaction in enumerate(last_interactions, 1):
+            # Limitar tamanho das mensagens para não sobrecarregar o contexto
+            user_msg = interaction.get("user", "")[:150] + ("..." if len(interaction.get("user", "")) > 150 else "")
+            ai_msg = interaction.get("ai", "")[:200] + ("..." if len(interaction.get("ai", "")) > 200 else "")
+            
+            context_messages.append(f"**Interação {i}:**")
+            context_messages.append(f"👤 Usuário: {user_msg}")
+            if ai_msg:
+                context_messages.append(f"🤖 Assistente: {ai_msg}")
+            context_messages.append("")  # Linha em branco para separação
+        
+        context_messages.append("---\n**Conversa atual:**\n")
+        return "\n".join(context_messages)
+    
+    return ""
 
 @app.route('/')
 def home():
@@ -81,7 +389,7 @@ def home():
         }
         
         .header-content {
-          max-width: 1200px;
+          max-width: 1400px;
           margin: 0 auto;
           display: flex;
           justify-content: space-between;
@@ -114,7 +422,13 @@ def home():
           letter-spacing: -0.025em;
         }
         
-        .theme-toggle {
+        .header-controls {
+          display: flex;
+          gap: 1rem;
+          align-items: center;
+        }
+        
+        .btn {
           background: transparent;
           border: 2px solid var(--primary-white);
           color: var(--primary-white);
@@ -124,19 +438,23 @@ def home():
           font-weight: 500;
           font-size: 0.875rem;
           transition: all 0.2s ease;
+          text-decoration: none;
+          display: inline-flex;
+          align-items: center;
+          gap: 0.5rem;
         }
         
-        .theme-toggle:hover {
+        .btn:hover {
           background: var(--primary-white);
           color: var(--primary-black);
         }
         
-        body.dark-mode .theme-toggle {
+        body.dark-mode .btn {
           border-color: var(--gray-400);
           color: var(--gray-400);
         }
         
-        body.dark-mode .theme-toggle:hover {
+        body.dark-mode .btn:hover {
           background: var(--gray-400);
           color: var(--primary-black);
         }
@@ -147,9 +465,9 @@ def home():
           margin: 0 auto;
           padding: 2rem;
           min-height: calc(100vh - 80px);
-          display: grid;
-          grid-template-columns: 1fr 2fr;
-          gap: 2rem;
+          display: flex;
+          justify-content: center;
+          align-items: flex-start;
           align-items: start;
         }
         
@@ -189,35 +507,7 @@ def home():
           color: var(--gray-400);
         }
         
-        .feature-list {
-          list-style: none;
-          space-y: 0.75rem;
-        }
-        
-        .feature-list li {
-          padding: 0.75rem;
-          background: var(--primary-white);
-          border-radius: 8px;
-          font-size: 0.875rem;
-          border: 1px solid var(--gray-200);
-          margin-bottom: 0.5rem;
-          transition: all 0.2s ease;
-        }
-        
-        .feature-list li:hover {
-          border-color: var(--gray-300);
-          box-shadow: var(--shadow-sm);
-        }
-        
-        body.dark-mode .feature-list li {
-          background: var(--gray-800);
-          border-color: var(--gray-700);
-          color: var(--gray-200);
-        }
-        
-        body.dark-mode .feature-list li:hover {
-          border-color: var(--gray-600);
-        }
+        /* Removed History Sidebar CSS - no longer needed */
         
         /* Chat Section */
         .chat-section {
@@ -226,6 +516,8 @@ def home():
           box-shadow: var(--shadow-xl);
           overflow: hidden;
           height: 600px;
+          width: 100%;
+          max-width: 800px;
           display: flex;
           flex-direction: column;
           border: 1px solid var(--gray-200);
@@ -248,6 +540,12 @@ def home():
         }
         
         .chat-header-content {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+        }
+        
+        .chat-info-left {
           display: flex;
           align-items: center;
           gap: 1rem;
@@ -285,6 +583,8 @@ def home():
           background: #10b981;
           border-radius: 50%;
         }
+        
+        /* Removed new-chat-btn styles - no longer needed */
         
         /* Messages */
         .chat-messages {
@@ -493,7 +793,20 @@ def home():
           background: var(--gray-800);
         }
         
+        /* Removed Modal Styles - no longer needed */
+        
         /* Responsive Design */
+        @media (max-width: 1200px) {
+          .container {
+            grid-template-columns: 250px 1fr;
+            gap: 1.5rem;
+          }
+          
+          .history-sidebar {
+            display: none;
+          }
+        }
+        
         @media (max-width: 1024px) {
           .container {
             grid-template-columns: 1fr;
@@ -558,6 +871,8 @@ def home():
         }
       </style>
       <script>
+        // Removido currentSessionId - agora usando conversa única contínua
+        
         window.addEventListener('DOMContentLoaded', function() {
           // Theme toggle functionality
           const themeBtn = document.getElementById('theme-toggle');
@@ -570,10 +885,14 @@ def home():
             }
           });
 
-          // Chat functionality
+          // Removed loadConversationHistory() - no longer needed
+
+          // Chat functionality  
           const chatInput = document.getElementById('chat-input');
           const sendBtn = document.getElementById('send-button');
           const messagesContainer = document.getElementById('chat-messages');
+
+          // Removed search functionality - no longer needed
 
           function scrollToBottom() {
             messagesContainer.scrollTop = messagesContainer.scrollHeight;
@@ -629,6 +948,8 @@ def home():
             setTimeout(scrollToBottom, 100);
           }
 
+          // Removed loadConversationHistory, loadConversation, and searchConversations functions - no longer needed
+
           async function sendMessage() {
             const message = chatInput.value.trim();
             if (message && !sendBtn.disabled) {
@@ -651,7 +972,10 @@ def home():
                   headers: {
                     'Content-Type': 'application/json',
                   },
-                  body: JSON.stringify({ message: message })
+                  body: JSON.stringify({ 
+                    message: message
+                    // Removed session_id - using single continuous conversation
+                  })
                 });
 
                 const data = await response.json();
@@ -661,6 +985,8 @@ def home():
                   'ai',
                   data.response_id
                 );
+
+                // Removed loadConversationHistory() call - no longer needed
 
               } catch (error) {
                 console.error('Erro ao enviar mensagem:', error);
@@ -687,10 +1013,33 @@ def home():
             this.style.height = Math.min(this.scrollHeight, 100) + 'px';
           });
 
-          // Initial AI message
-          setTimeout(() => {
-            addMessage('Olá! Sou o SmartOps AI. Como posso ajudá-lo hoje?', 'ai');
-          }, 500);
+          // Removed history modal functionality - no longer needed
+          
+          // Load current conversation on page load
+          async function loadCurrentConversation() {
+            try {
+              const response = await fetch('/get_current_conversation');
+              const data = await response.json();
+              
+              if (data.success && data.messages.length > 0) {
+                messagesContainer.innerHTML = '';
+                data.messages.forEach(msg => {
+                  addMessage(msg.content, msg.message_type, msg.response_id);
+                });
+              } else {
+                // Show welcome message if no conversation exists
+                addMessage('Olá! Sou o SmartOps AI. Como posso ajudá-lo hoje?', 'ai');
+              }
+            } catch (error) {
+              console.error('Erro ao carregar conversa:', error);
+              addMessage('Olá! Sou o SmartOps AI. Como posso ajudá-lo hoje?', 'ai');
+            }
+          }
+          
+          // Load conversation on page load
+          loadCurrentConversation();
+          
+          // Removed loadConversationHistory() - no longer needed
         });
       </script>
     </head>
@@ -699,15 +1048,19 @@ def home():
       <header class="header">
         <div class="header-content">
           <div class="logo">
-            <img src="static/images/WoodLogoColour2.png " width=200px>
+            <div class="logo-icon">W</div>
+            <div class="logo-text">SmartOps AI</div>
           </div>
-          <button id="theme-toggle" class="theme-toggle">Modo Escuro</button>
+          <div class="header-controls">
+            <!-- Removed history button - no longer needed -->
+            <button id="theme-toggle" class="btn">Modo Escuro</button>
+          </div>
         </div>
       </header>
 
       <!-- Main Container -->
       <div class="container">
-        <!-- Sidebar -->
+        <!-- Left Sidebar -->
         <aside class="sidebar">
           <h2 class="sidebar-title">
             🧠 Assistente Virtual Wood
@@ -721,14 +1074,17 @@ def home():
         <main class="chat-section">
           <div class="chat-header">
             <div class="chat-header-content">
-              <div class="chat-avatar">🤖</div>
-              <div class="chat-info">
-                <h3>SmartOps AI</h3>
-                <div class="chat-status">
-                  <div class="status-indicator"></div>
-                  <span>Online</span>
+              <div class="chat-info-left">
+                <div class="chat-avatar">🤖</div>
+                <div class="chat-info">
+                  <h3>SmartOps AI</h3>
+                  <div class="chat-status">
+                    <div class="status-indicator"></div>
+                    <span>Online</span>
+                  </div>
                 </div>
               </div>
+              <!-- Removed Nova Conversa button - using single continuous chat -->
             </div>
           </div>
 
@@ -752,7 +1108,11 @@ def home():
             </div>
           </div>
         </main>
+
+        <!-- Removed Right Sidebar - History no longer needed -->
       </div>
+
+      <!-- Removed History Modal - No longer needed -->
     </body>
     </html>
     """
@@ -851,10 +1211,9 @@ def markdown_to_html(markdown_text):
     html_content = html_content.replace('<', '&lt;')
     html_content = html_content.replace('>', '&gt;')
     
-    # Processar títulos (# ## ###)
-    html_content = re.sub(r'^### (.+)$', r'<h3>\1</h3>', html_content, flags=re.MULTILINE)
-    html_content = re.sub(r'^## (.+)$', r'<h2>\1</h2>', html_content, flags=re.MULTILINE)
-    html_content = re.sub(r'^# (.+)$', r'<h1>\1</h1>', html_content, flags=re.MULTILINE)
+    html_content = html_content.replace('&', '&amp;')
+    html_content = html_content.replace('<', '&lt;')
+    html_content = html_content.replace('>', '&gt;')
     
     # Processar formatação inline (negrito e itálico)
     html_content = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', html_content)
@@ -973,7 +1332,6 @@ def format_markdown_to_html(markdown_text, user_question=""):
             letter-spacing: 1px;
         }}
         
-       
         .content {{
             text-align: justify;
             font-size: 12pt;
@@ -1150,18 +1508,48 @@ def chat():
     try:
         data = request.get_json()
         user_message = data.get('message', '')
-       
+        # session_id não é mais usado - removido para conversas contínuas
+        
+        # Obter IP do cliente e ID do usuário
+        client_ip = get_client_ip()
+        user_id = db_manager.get_user_id(client_ip)
+        
+        # Obter ou criar conversa única do usuário
+        conversation_id = db_manager.get_current_conversation_id(user_id)
+        
+        # Obter mensagens recentes da conversa única do usuário
+        # Busca mais mensagens para manter contexto completo
+        recent_messages = db_manager.get_recent_session_messages(conversation_id, limit=12)
+        
+        # Construir contexto das mensagens anteriores
+        context = build_context_from_history(recent_messages)
+        
+        # Salvar mensagem do usuário
+        db_manager.save_message(conversation_id, 'user', user_message)
+        
+        # Preparar mensagem com contexto para o Langflow
+        contextual_message = context + user_message if context else user_message
+        
+        # Log para debug (configurável)
+        if DEBUG_MEMORY:
+            print(f"\n🔄 Nova mensagem do usuário (IP: {client_ip[:10]}...):")
+            print(f"📝 Mensagem: {user_message}")
+            print(f"🧠 Contexto aplicado: {'Sim' if context else 'Não'}")
+            if context:
+                print(f"📊 Tamanho do contexto: {len(context)} caracteres")
+                print(f"📋 Mensagens na conversa: {len(recent_messages)}")
+        
         # Configuração do Langflow
         langflow_url = "http://localhost:7860"
         flow_id = "7da02070-24ec-4cc2-bb99-e089ce0cc283"
-       
+        
         payload = {
-            "input_value": user_message,
+            "input_value": contextual_message,
             "output_type": "chat",
             "input_type": "chat",
             "tweaks": {}
         }
-       
+        
         with requests.Session() as session:
             response = session.post(
                 f"{langflow_url}/api/v1/run/{flow_id}",
@@ -1175,8 +1563,12 @@ def chat():
                 ai_response = extract_clean_response(result)
             else:
                 ai_response = f"Erro na comunicação com o agente (Status: {response.status_code})"
-               
+        
+        # Gerar response_id e salvar resposta da IA
         response_id = str(uuid.uuid4())
+        db_manager.save_message(conversation_id, 'ai', ai_response, response_id)
+        
+        # Manter compatibilidade com sistema antigo
         stored_responses[response_id] = {
             'response': ai_response,
             'question': user_message,
@@ -1194,6 +1586,146 @@ def chat():
     except Exception as e:
         ai_response = f"Erro interno: {str(e)}"
         return jsonify({"response": ai_response})
+
+@app.route('/get_current_conversation', methods=['GET'])
+def get_current_conversation():
+    """Retorna as mensagens da conversa única do usuário"""
+    try:
+        client_ip = get_client_ip()
+        user_id = db_manager.get_user_id(client_ip)
+        
+        # Obter a conversa única do usuário
+        conversation_id = db_manager.get_current_conversation_id(user_id)
+        
+        # Buscar todas as mensagens da conversa
+        messages = db_manager.get_conversation_messages(conversation_id, user_id)
+        
+        formatted_messages = []
+        for msg in messages:
+            formatted_messages.append({
+                'message_type': msg[0],
+                'content': msg[1],
+                'timestamp': msg[2],
+                'response_id': msg[3]
+            })
+        
+        return jsonify({
+            "success": True,
+            "messages": formatted_messages
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route('/get_conversations', methods=['GET'])
+def get_conversations():
+    """Retorna lista de conversas do usuário"""
+    try:
+        client_ip = get_client_ip()
+        user_id = db_manager.get_user_id(client_ip)
+        
+        conversations = db_manager.get_user_conversations(user_id)
+        
+        formatted_conversations = []
+        for conv in conversations:
+            formatted_conversations.append({
+                'id': conv[0],
+                'session_id': conv[1],
+                'created_at': conv[2],
+                'last_message_at': conv[3],
+                'title': conv[4],
+                'message_count': conv[5],
+                'first_message': conv[6]
+            })
+        
+        return jsonify({
+            "conversations": formatted_conversations
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/get_conversation/<int:conversation_id>', methods=['GET'])
+def get_conversation(conversation_id):
+    """Retorna mensagens de uma conversa específica"""
+    try:
+        client_ip = get_client_ip()
+        user_id = db_manager.get_user_id(client_ip)
+        
+        messages = db_manager.get_conversation_messages(conversation_id, user_id)
+        
+        formatted_messages = []
+        for msg in messages:
+            formatted_messages.append({
+                'message_type': msg[0],
+                'content': msg[1],
+                'timestamp': msg[2],
+                'response_id': msg[3]
+            })
+        
+        return jsonify({
+            "success": True,
+            "messages": formatted_messages
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route('/search_conversations', methods=['POST'])
+def search_conversations():
+    """Busca conversas por conteúdo"""
+    try:
+        data = request.get_json()
+        query = data.get('query', '')
+        
+        if not query.strip():
+            return jsonify({"results": []})
+        
+        client_ip = get_client_ip()
+        user_id = db_manager.get_user_id(client_ip)
+        
+        results = db_manager.search_conversations(user_id, query)
+        
+        formatted_results = []
+        for result in results:
+            formatted_results.append({
+                'id': result[0],
+                'session_id': result[1],
+                'created_at': result[2],
+                'last_message_at': result[3],
+                'title': result[4],
+                'matching_content': result[5]
+            })
+        
+        return jsonify({
+            "results": formatted_results
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/get_full_history', methods=['GET'])
+def get_full_history():
+    """Retorna histórico completo do usuário para o modal"""
+    try:
+        client_ip = get_client_ip()
+        user_id = db_manager.get_user_id(client_ip)
+        
+        # Buscar histórico mais extenso para o modal
+        history = db_manager.get_conversation_history(user_id, limit=100)
+        
+        formatted_history = []
+        for msg in history:
+            formatted_history.append({
+                'message_type': msg[0],
+                'content': msg[1],
+                'timestamp': msg[2]
+            })
+        
+        # Reverter ordem para mostrar do mais antigo para o mais novo no modal
+        formatted_history.reverse()
+        
+        return jsonify({
+            "history": formatted_history
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/generate_html', methods=['POST'])
 def generate_html():
